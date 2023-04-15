@@ -3,6 +3,9 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Bernoulli, Multinomial, Categorical
 import numpy as np
+import pandas as pd
+import pickle
+from typing import Dict
 
 # set up parameters
 CHUNCK_SIZE = 20
@@ -79,7 +82,7 @@ def compute_policy_value_losses(cost_ep, loss, saved_log_probs, baseline_value_e
     return policy_loss_ep, value_losses
 
 
-def evaluate(clstm, policy_s, policy_n, policy_c, iterator):
+def evaluate(clstm, policy_s, policy_n, policy_c, loader):
     '''
     Evaluate a model with skimming, rereading, and early stopping
     and compute the average FLOPs per data.
@@ -95,20 +98,23 @@ def evaluate(clstm, policy_s, policy_n, policy_c, iterator):
     # the sum of FLOPs of the iterator set
     flops_sum = 0
     with torch.no_grad():
-        for batch in iterator:
-            label = batch.label.to(torch.long)  # for cross entropy loss, the long type is required
-            text = batch.text.view(CHUNCK_SIZE, BATCH_SIZE, CHUNCK_SIZE) # transform 1*400 to 20*1*20
+        for x, y in loader:
+            label = y.to(device).long() # for cross entropy loss, the long type is required
+            text = x.to(device).view(CHUNCK_SIZE, BATCH_SIZE, CHUNCK_SIZE) # transform 1*400 to 20*1*20
             curr_step = 0
-            h_0 = torch.zeros([1,1,128]).to(device)
-            c_0 = torch.zeros([1,1,128]).to(device)
+            n_rnn_layers = clstm.n_rnn_layers
+            lstm_hidden_dim = clstm.lstm_hidden_dim
+            h_0 = torch.zeros([n_rnn_layers,1,lstm_hidden_dim]).to(device)
+            c_0 = torch.zeros([n_rnn_layers,1,lstm_hidden_dim]).to(device)
             count = 0
             while curr_step < 20 and count < 5: # loop until a text can be classified or currstep is up to 20
                 count += 1
                 # pass the input through cnn-lstm and policy s
                 text_input = text[curr_step] # text_input 1*20
                 ht, ct = clstm(text_input, h_0, c_0)  # 1 * 128
-                h_0 = ht.unsqueeze(0)  # 1 * 1 * 128, next input of lstm
+                h_0 = ht.unsqueeze(0) # NUM_RNN_LAYERS * 1 * LSTM_HIDDEN_DIM, next input of lstm
                 c_0 = ct
+                # ht_ = ht.view(1, ht.shape[0] * ht.shape[2])
                 # draw a stop decision
                 stop_decision, log_prob_s = sample_policy_s(ht, policy_s)
                 flops_sum += clstm_cost + s_cost
@@ -129,12 +135,62 @@ def evaluate(clstm, policy_s, policy_n, policy_c, iterator):
                 count_correct += 1
             count_all += 1
     print('Evaluation time elapsed: %.2f s' % (time.time() - start))
-    avg_flop_per_sample = int(flops_sum / len(iterator))
+    avg_flop_per_sample = int(flops_sum / len(loader))
     print('Average FLOPs per sample: ', avg_flop_per_sample)
     return count_all, count_correct
 
+def openDfFromPickle(path: str) -> pd.DataFrame:
+    """Open stored dataframes from pickle files.
 
-def evaluate_earlystop(clstm, policy_s, policy_c, iterator):
+    Args:
+        path (str): File path.
+
+    Returns:
+        pd.DataFrame: Dataframe read.
+    """
+    assert path.endswith(".pkl"), \
+        f"Given file path must end with .pkl, got {path}."
+
+    file = open(path, "rb")
+    data = pickle.load(file)
+    file.close()
+    return data
+
+def calculate_stats_from_cm(confusion_matrix: np.ndarray, macro_avg: bool = True) -> Dict[str, float]:
+    """Calculate accuracy, precision, recall and F1 Score from a given confusion matrix.
+       By default, macro avg. of precision, recall and F1 Score is calculated.
+    Args:
+        confusion_matrix (np.ndarray): Confusion matrix.
+        macro_avg (bool): Whether to calculate macro avg. or not. Set it false to calculate micro avg.
+    Returns:
+        Dict[str, float]: Dictionary of stats -- {"accuracy": acc_val, "precision": prec_val, "recall": rec_val, "f1": f1_val}
+    """
+    if macro_avg:
+        precisions = np.zeros((confusion_matrix.shape[0],))  # per class precision scores
+        recalls = np.zeros((confusion_matrix.shape[0],)) # per class recall scores
+        f1s = np.zeros((confusion_matrix.shape[0],)) # per class f1 scores
+        for j in range(confusion_matrix.shape[0]):
+            if np.sum(confusion_matrix[j, :]) != 0:
+                precisions[j] = confusion_matrix[j, j] / np.sum(confusion_matrix[j, :])
+                
+            if np.sum(confusion_matrix[:, j]) != 0:
+                recalls[j] = confusion_matrix[j, j] / np.sum(confusion_matrix[:, j])
+            
+            if precisions[j] + recalls[j] != 0:
+                f1s[j] = 2*precisions[j]*recalls[j] / (precisions[j]+recalls[j])
+
+            
+        macro_f1 = np.average(f1s) # if sum(f1s) > 0 else 0.
+        macro_precision = np.average(precisions) # if sum(precisions) > 0 else 0.
+        macro_recall = np.average(recalls) # if sum(recalls) > 0 else 0.
+        accuracy = np.sum(np.diagonal(confusion_matrix)) / np.sum(confusion_matrix) # if np.sum(confusion_matrix) > 0 else 0.
+
+        return {"accuracy": accuracy, "precision": macro_precision, "recall": macro_recall, "f1": macro_f1}
+    else: 
+        raise NotImplementedError
+
+
+def evaluate_earlystop(clstm, policy_s, policy_c, loader):
     '''
     Evaluate a early stopping model with only a stopping module
     and compute the average FLOPs per data.
@@ -149,7 +205,7 @@ def evaluate_earlystop(clstm, policy_s, policy_c, iterator):
     # the sum of FLOPs of the iterator set
     flops_sum = 0
     with torch.no_grad():
-        for batch in iterator:
+        for batch in loader:
             label = batch.label.to(torch.long) # 64
             text = batch.text.view(CHUNCK_SIZE, BATCH_SIZE, CHUNCK_SIZE) # transform 1*400 to 20*1*20
             curr_step = 0
@@ -185,7 +241,7 @@ def evaluate_earlystop(clstm, policy_s, policy_c, iterator):
                 count_correct += 1
             count_all += 1     
     print('Evaluation time elapsed: %.2f s' % (time.time() - start))
-    avg_flop_per_sample = int(flops_sum / len(iterator))
+    avg_flop_per_sample = int(flops_sum / len(loader))
     print('Average FLOPs per sample: ', avg_flop_per_sample)  
     return count_all, count_correct
 

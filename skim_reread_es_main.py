@@ -10,7 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.distributions import Bernoulli, Categorical
 from torchtext import datasets
-from torchtext import data
+from torchtext.legacy import data
 import os
 import time
 import numpy as np 
