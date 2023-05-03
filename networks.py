@@ -243,33 +243,40 @@ class MultiHeadAttention(nn.Module):
         N = query.shape[0]
         value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
 
+        # print("*-*- Inside MHA *-*-")
+        # print(f"mems: {values.shape}, query: {query.shape}")
         # Split the embedding into self.num_heads different pieces
         values = values.reshape(N, value_len, self.num_heads, self.head_size)
         keys = keys.reshape(N, key_len, self.num_heads, self.head_size)
         query = query.reshape(N, query_len, self.num_heads, self.head_size)
+        # print(f"MHA 1 -- values: {values.shape}, keys: {keys.shape} query: {query.shape}, mask: {mask.shape}")
 
         values = self.values(values)  # (N, value_len, heads, head_dim)
         keys = self.keys(keys)  # (N, key_len, heads, head_dim)
         queries = self.queries(query)  # (N, query_len, heads, heads_dim)
+        # print(f"MHA 2 -- values: {values.shape}, keys: {keys.shape} query: {query.shape}, mask: {mask.shape}")
+
 
         # Einsum does matrix mult. for query*keys for each training example
         energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
         # queries shape: (N, query_len, heads, heads_dim),
         # keys shape: (N, key_len, heads, heads_dim)
         # energy: (N, heads, query_len, key_len)
-
+        # print(f"MHA 3 -- energy: {energy.shape}")
         # Mask padded indices so their attention weights become 0
         if mask is not None:
             energy = energy.masked_fill(mask.unsqueeze(1).unsqueeze(1) == 0, float("-1e20")) # -inf causes NaN
-
+        # print(f"MHA 4 -- energy: {energy.shape}")
         # Normalize energy values and apply softmax wo retreive the attention scores
         attention = torch.softmax(energy / (self.embed_dim ** (1 / 2)), dim=3)
+        # print(f"MHA 5 -- attention: {attention.shape}")
         # attention shape: (N, heads, query_len, key_len)
 
         # Scale values by attention weights
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(
             N, query_len, self.num_heads * self.head_size
         )
+        # print(f"MHA 6 -- out: {out.shape}")
         # attention shape: (N, heads, query_len, key_len)
         # values shape: (N, value_len, heads, heads_dim)
         # out after matrix multiply: (N, query_len, heads, head_dim), then
@@ -277,6 +284,7 @@ class MultiHeadAttention(nn.Module):
 
         # Forward projection
         out = self.fc_out(out)
+        # print(f"MHA 7 -- energy: {out.shape}")
         # Linear layer doesn't modify the shape, final shape will be
         # (N, query_len, embed_dim)
 
@@ -322,6 +330,9 @@ class TransformerBlock(Module):
             torch.tensor -- Output
             torch.tensor -- Attention weights
         """
+        """print("-- Inside block forward --")
+        print(f"mems[:, :, i]: {value.shape}, h.unsqueeze(1): {query.shape}, mask: {mask.shape}")
+        print(f"Applying normalization")"""
         # Apply pre-layer norm across the attention input
         if self.layer_norm == "pre":
             query_ = self.norm1(query)
@@ -330,8 +341,10 @@ class TransformerBlock(Module):
         else:
             query_ = query
 
+        # print(f"Before MHA value: {value.shape}, key: {key.shape}, query: {query_.shape}, mask: {mask.shape}")
         # Forward MultiHeadAttention
         attention, attention_weights = self.attention(value, key, query_, mask)
+        # print(f"After MHA B1 -> attention: {attention.shape}, attention_weights: {attention_weights.shape}")
 
         # GRU Gate or skip connection
         if self.use_gtrxl:
@@ -340,6 +353,8 @@ class TransformerBlock(Module):
         else:
             # Skip connection
             h = attention + query
+        
+        # print(f"B2 -> h: {h.shape}")
         
         # Apply post-layer norm across the attention output (i.e. projection input)
         if self.layer_norm == "post":
@@ -350,9 +365,12 @@ class TransformerBlock(Module):
             h_ = self.norm2(h)
         else:
             h_ = h
+        
+        # print(f"B3 -> h_: {h_.shape}")
 
         # Forward projection
         forward = self.fc(h_)
+        # print(f"B4 -> forward: {forward.shape}")
 
         # GRU Gate or skip connection
         if self.use_gtrxl:
@@ -361,10 +379,12 @@ class TransformerBlock(Module):
         else:
             # Skip connection
             out = forward + h
+        # print(f"B5 -> out: {out.shape}")
         
         # Apply post-layer norm across the projection output
         if self.layer_norm == "post":
             out = self.norm2(out)
+        # print(f"B6 -> out: {out.shape}")
 
         return out, attention_weights
 
@@ -396,24 +416,26 @@ class Transformer(nn.Module):
         self.num_blocks = config["num_blocks"]
         self.embed_dim = config["embed_dim"]
         self.num_heads = config["num_heads"]
+        self.trns_input_dim = config["trns_input_dim"]
         self.max_episode_steps = max_episode_steps
         self.activation = nn.ReLU()
 
         # Input embedding layer
-        self.linear_embedding = nn.Linear(input_dim, self.embed_dim)
+        self.linear_embedding = nn.Embedding(30528, self.embed_dim) # nn.Linear(input_dim, self.embed_dim)
         nn.init.orthogonal_(self.linear_embedding.weight, np.sqrt(2))
+        self.conv = nn.Conv2d(100, 10, 4, 1, padding="same")
 
         # Determine positional encoding
         if config["positional_encoding"] == "relative":
-            self.pos_embedding = SinusoidalPosition(dim = self.embed_dim)
+            self.pos_embedding = SinusoidalPosition(dim = self.trns_input_dim // self.embed_dim)
         elif config["positional_encoding"] == "learned":
-            self.pos_embedding = nn.Parameter(torch.randn(self.max_episode_steps, self.embed_dim)) # (batch size, max episoded steps, num layers, layer size)
+            self.pos_embedding = nn.Parameter(torch.randn(self.max_episode_steps, self.trns_input_dim // self.embed_dim)) # (batch size, max episoded steps, num layers, layer size)
         else:
             pass    # No positional encoding is used
         
         # Instantiate transformer blocks
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(self.embed_dim, self.num_heads, config) 
+            TransformerBlock(self.trns_input_dim, self.num_heads, config) 
             for _ in range(self.num_blocks)])
 
     def forward(self, h, memories, mask, memory_indices):
@@ -428,8 +450,15 @@ class Transformer(nn.Module):
             {torch.tensor} -- Out memories (i.e. inputs to the transformer blocks)
         """
         # Feed embedding layer and activate
-        h = self.activation(self.linear_embedding(h))
-
+        # print("Inside transformer forward")
+        # print(f"h: {h.shape}, memories: {memories.shape}, mask, {mask.shape}, memory_indices: {memory_indices.shape}")
+        h = self.linear_embedding(h)
+        # print(f"after embedding h: {h.shape}")
+        h = h.permute(0, 2, 1).unsqueeze(2)
+        h = self.activation(self.conv(h))
+        # print(f"1 h: {h.shape}")
+        h = h.reshape(h.shape[0], -1)
+        # print(f"1.1: h: {h.shape}")
         # Add positional encoding to every transformer block input
         if self.config["positional_encoding"] == "relative":
             pos_embedding = self.pos_embedding(self.max_episode_steps)[memory_indices]
@@ -438,16 +467,19 @@ class Transformer(nn.Module):
         elif self.config["positional_encoding"] == "learned":
             memories = memories + self.pos_embedding[memory_indices].unsqueeze(2)
             # memories[:,:,0] = memories[:,:,0] + self.pos_embedding[memory_indices] # add positional encoding only to first layer?
-
+        # print(f"2 memories: {memories.shape}")
         # Forward transformer blocks
         out_memories = []
         for i, block in enumerate(self.transformer_blocks):
             out_memories.append(h.detach())
+            # print(f"before block mems_i: {memories[:,:,i].shape}")
             h, attention_weights = block(memories[:, :, i], memories[:, :, i], h.unsqueeze(1), mask) # args: value, key, query, mask
             h = h.squeeze()
             if len(h.shape) == 1:
                 h = h.unsqueeze(0)
-        return h, torch.stack(out_memories, dim=1)
+        out_memories = torch.stack(out_memories, dim=1)
+        # print("After blocks, h, out_memories: ", h.shape, out_memories.shape)
+        return h, out_memories
     
 class GRUGate(nn.Module):
     """

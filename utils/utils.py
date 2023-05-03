@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pickle
 from typing import Dict
+from tqdm import tqdm
 
 # set up parameters
 CHUNCK_SIZE = 20
@@ -98,7 +99,7 @@ def evaluate(clstm, policy_s, policy_n, policy_c, loader):
     # the sum of FLOPs of the iterator set
     flops_sum = 0
     with torch.no_grad():
-        for x, y in loader:
+        for x, y in tqdm(loader, desc="Evaluating..."):
             label = y.to(device).long() # for cross entropy loss, the long type is required
             text = x.to(device).view(CHUNCK_SIZE, BATCH_SIZE, CHUNCK_SIZE) # transform 1*400 to 20*1*20
             curr_step = 0
@@ -114,6 +115,71 @@ def evaluate(clstm, policy_s, policy_n, policy_c, loader):
                 ht, ct = clstm(text_input, h_0, c_0)  # 1 * 128
                 h_0 = ht.unsqueeze(0) # NUM_RNN_LAYERS * 1 * LSTM_HIDDEN_DIM, next input of lstm
                 c_0 = ct
+                # ht_ = ht.view(1, ht.shape[0] * ht.shape[2])
+                # draw a stop decision
+                stop_decision, log_prob_s = sample_policy_s(ht, policy_s)
+                flops_sum += clstm_cost + s_cost
+                stop_decision = stop_decision.item()
+                if stop_decision == 1: # classify
+                    break
+                else:
+                    # draw an action (reread or skip)
+                    step, log_prob_n = sample_policy_n(ht, policy_n)
+                    flops_sum += n_cost
+                    curr_step += int(step)  # reread or skip
+            # draw a predicted label
+            output_c = policy_c(ht)
+            flops_sum += c_cost
+            # draw a predicted label 
+            pred_label, log_prob_c = sample_policy_c(output_c)
+            if pred_label.item() == label:
+                count_correct += 1
+            count_all += 1
+    print('Evaluation time elapsed: %.2f s' % (time.time() - start))
+    avg_flop_per_sample = int(flops_sum / len(loader))
+    print('Average FLOPs per sample: ', avg_flop_per_sample)
+    return count_all, count_correct
+
+
+def evaluate_transformer(transformer, policy_s, policy_n, policy_c, loader):
+    '''
+    Evaluate a model with skimming, rereading, and early stopping
+    and compute the average FLOPs per data.
+    '''
+    # set the models in evaluation mode
+    transformer_config = transformer.config
+    memory_length = transformer_config["memory_length"]
+    num_blocks = transformer_config["num_blocks"]
+    embed_dim = transformer_config["embed_dim"]
+    trns_input_dim = transformer_config["trns_input_dim"]
+    max_episode_length = 20
+    num_workers = 1
+    transformer.eval()
+    policy_s.eval()
+    policy_n.eval()
+    policy_c.eval()
+    count_all = 0
+    count_correct = 0
+    start = time.time()
+    # the sum of FLOPs of the iterator set
+    flops_sum = 0
+    with torch.no_grad():
+        for x, y in tqdm(loader, desc="Evaluating..."):
+            label = y.to(device).long() # for cross entropy loss, the long type is required
+            text = x.to(device).view(CHUNCK_SIZE, BATCH_SIZE, CHUNCK_SIZE) # transform 1*400 to 20*1*20
+            curr_step = 0
+            # Setup placeholders for each worker's current episodic memory
+            memory = torch.zeros((num_workers, memory_length, num_blocks, trns_input_dim), dtype=torch.float32).to(device)
+            memory_mask = torch.tril(torch.ones((num_workers, memory_length)), diagonal=-1).to(device)
+            repetitions = torch.repeat_interleave(torch.arange(0, memory_length).unsqueeze(0), memory_length - 1, dim = 0).long()
+            memory_indices = torch.stack([torch.arange(i, i + memory_length) for i in range(max_episode_length - memory_length + 1)]).long()
+            memory_indices = torch.cat((repetitions, memory_indices)).to(device)
+            count = 0
+            while curr_step < 20 and count < 5: # loop until a text can be classified or currstep is up to 20
+                count += 1
+                # pass the input through cnn-lstm and policy s
+                text_input = text[curr_step] # text_input 1*20
+                ht, memory_t = transformer(text_input, memory, memory_mask, memory_indices)
                 # ht_ = ht.view(1, ht.shape[0] * ht.shape[2])
                 # draw a stop decision
                 stop_decision, log_prob_s = sample_policy_s(ht, policy_s)
