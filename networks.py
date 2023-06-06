@@ -5,9 +5,9 @@ import numpy as np
 import torch.nn as nn
 import torch
 from einops import rearrange
+import transformers
 
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class CNN_LSTM(nn.Module):
     '''Encoder
@@ -62,6 +62,219 @@ class CNN_LSTM(nn.Module):
         conved = torch.transpose(conved, 1, 2)  # 1 * 16 * 128
         conved = torch.transpose(conved, 1, 0)  # 16 * 1 * 128
         output, (hidden, cell) = self.lstm(conved, (h_0, c_0))
+        ht = hidden.squeeze(0)  # 1 * 128
+        return ht, cell
+
+
+class Transformer_LSTM(nn.Module):
+    '''Encoder
+    Embedding -> Transformer Encoder layer -> One-layer LSTM
+    '''
+    def __init__(self, input_dim, embedding_dim, n_trns_layers, n_rnn_layers, hidden_dim):
+        super().__init__()
+        self.n_rnn_layers = n_rnn_layers
+        self.lstm_hidden_dim = hidden_dim
+        self.embedding_dim = embedding_dim
+        self.embedding = nn.Embedding(input_dim, embedding_dim)
+        transformer_encoder_layer = nn.TransformerEncoderLayer(d_model=embedding_dim, nhead=4)
+        self.transformer_encoder = nn.TransformerEncoder(transformer_encoder_layer, num_layers=n_trns_layers)
+        self.lstm = nn.LSTM(input_size=embedding_dim, hidden_size=hidden_dim, num_layers=n_rnn_layers)
+        self.dropout = nn.Dropout(p=0.2)
+        self.relu = nn.ReLU()
+
+        with torch.no_grad():
+            dummy = torch.randint(0, 5, (1, 20))
+            h0 = torch.zeros((self.n_rnn_layers, 1, self.lstm_hidden_dim))
+            c0 = torch.zeros((self.n_rnn_layers, 1, self.lstm_hidden_dim))
+            print(f"dummy start: {dummy.shape}")
+            dummy = self.embedding(dummy)
+            print(f"Embedding: {dummy.shape}")
+            dummy = self.transformer_encoder(dummy)
+            print(f"Transformer: {dummy.shape}")
+            dummy = torch.permute(dummy, (1, 0, 2))
+            print(f"permute: {dummy.shape}")
+            dummy, (hidden, cell) = self.lstm(dummy, (h0, c0))
+            print(f"lstm out: {dummy.shape}, hidden: {hidden.shape}, cell: {cell.shape}")
+            ht = hidden.squeeze(0)
+            print(ht.shape)
+
+   
+    def forward(self, text, h_0, c_0):
+        # transformer and LSTM network
+        '''
+        At every time step, the model reads one chunk which has a size of 20 words.
+
+        --- input & output dimension ---
+        
+        Input text: 1 * 20
+        
+        **Embedding**
+        1.Input: 1 * 20
+        2.Output: 1 * 20 * 100
+        
+        **Transformer Encoder**
+        1. Input(minibatch×seq_len×embedding_dim): 1 * 20 * 100
+        2. Output(minibatch×seq_len×embedding_dim): 1 * 20 * 100
+        
+        **LSTM**
+        1. Inputs: input, (h_0, c_0)
+        input(seq_len, batch, input_size): (20, 1 , 128)
+        c_0(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        h_0(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        2. Outputs: output, (h_n, c_n)
+        output:
+        h_n(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        
+
+        '''
+        embedded = self.embedding(text)
+        trns = self.transformer_encoder(embedded)
+        trns = torch.permute(trns, (1, 0, 2))
+        output, (hidden, cell) = self.lstm(trns, (h_0, c_0))
+        ht = hidden.squeeze(0)  # 1 * 128
+        return ht, cell
+
+
+class Distilbert_LSTM(nn.Module):
+    def __init__(self, n_rnn_layers: int, lstm_hidden_dim: int, bert_checkpoint: str = "distilbert-base-uncased", freeze_bert: bool = False):
+        super().__init__()
+        self.n_rnn_layers = n_rnn_layers
+        self.lstm_hidden_dim = lstm_hidden_dim
+        self.distilbert = transformers.AutoModel.from_pretrained(bert_checkpoint)
+
+        if freeze_bert:
+            self.distilbert = self.distilbert.requires_grad_(False)
+        
+        self.dropout = nn.Dropout(p=0.2)
+        self.relu = nn.ReLU()
+
+        dummy = self.calculate_lm_output()
+        self.lstm_input_dim = dummy.shape[-1]
+        self.lstm = nn.LSTM(input_size=self.lstm_input_dim, hidden_size=lstm_hidden_dim, num_layers=n_rnn_layers)
+        self.assert_forward()
+
+    def calculate_lm_output(self) -> torch.Tensor:
+        with torch.no_grad():
+            dummy = torch.randint(0, 5, (1, 20))
+            dummy_mask = torch.randint(0, 1, (1, 20))
+            print(f"dummy start: {dummy.shape}")
+            dummy = self.distilbert(dummy, dummy_mask).last_hidden_state
+            print(f"Transformer: {dummy.shape}")
+            dummy = torch.permute(dummy, (1, 0, 2))
+            print(f"permute: {dummy.shape}")
+
+            return dummy
+    
+    def assert_forward(self):
+        dummy = self.calculate_lm_output()
+        h0 = torch.zeros((self.n_rnn_layers, 1, self.lstm_hidden_dim))
+        c0 = torch.zeros((self.n_rnn_layers, 1, self.lstm_hidden_dim))
+        with torch.no_grad():
+            dummy2, (hidden, cell) = self.lstm(dummy, (h0, c0))
+            print(f"lstm out: {dummy2.shape}, hidden: {hidden.shape}, cell: {cell.shape}")
+            ht = hidden.squeeze(0)
+            print(ht.shape)
+
+   
+    def forward(self, text, text_mask, h_0, c_0):
+        # Distilbert and LSTM network
+        '''
+        At every time step, the model reads one chunk which has a size of 20 words and chunk mask of size 20.
+
+        --- input & output dimension ---
+        
+        Input text: 1 * 20, mask: 1 * 20
+        
+        **DistilBERT**
+        1. Input(minibatch×seq_len, minibatch×seq_len): 1 * 20 * 100
+        2. Output(seq_len×minibatch×out_dim): 20 * 1 * 768
+        
+        **LSTM**
+        1. Inputs: input, (h_0, c_0)
+        input(seq_len, batch, input_size): (20, 1 , 768)
+        c_0(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        h_0(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        2. Outputs: output, (h_n, c_n)
+        output:
+        h_n(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        
+
+        '''
+        embedded = self.distilbert(text, text_mask).last_hidden_state
+        trns = torch.permute(embedded, (1, 0, 2))
+        output, (hidden, cell) = self.lstm(trns, (h_0, c_0))
+        ht = hidden.squeeze(0)  # 1 * 128
+        return ht, cell
+
+
+class Alpaca_LSTM(nn.Module):
+    def __init__(self, n_rnn_layers: int, lstm_hidden_dim: int, freeze_bert: bool = False):
+        super().__init__()
+        self.n_rnn_layers = n_rnn_layers
+        self.lstm_hidden_dim = lstm_hidden_dim
+        self.distilbert = transformers.AutoModel.from_pretrained("chavinlo/alpaca-native")
+
+        if freeze_bert:
+            self.distilbert = self.distilbert.requires_grad_(False)
+        
+        self.dropout = nn.Dropout(p=0.2)
+        self.relu = nn.ReLU()
+
+        dummy = self.calculate_lm_output()
+        self.lstm_input_dim = dummy.shape[-1]
+        self.lstm = nn.LSTM(input_size=self.lstm_input_dim, hidden_size=lstm_hidden_dim, num_layers=n_rnn_layers)
+        self.assert_forward()
+
+    def calculate_lm_output(self) -> torch.Tensor:
+        with torch.no_grad():
+            dummy = torch.randint(0, 5, (1, 20))
+            dummy_mask = torch.randint(0, 1, (1, 20))
+            print(f"dummy start: {dummy.shape}")
+            dummy = self.distilbert(dummy, dummy_mask).last_hidden_state
+            print(f"Transformer: {dummy.shape}")
+            dummy = torch.permute(dummy, (1, 0, 2))
+            print(f"permute: {dummy.shape}")
+
+            return dummy
+    
+    def assert_forward(self):
+        dummy = self.calculate_lm_output()
+        h0 = torch.zeros((self.n_rnn_layers, 1, self.lstm_hidden_dim))
+        c0 = torch.zeros((self.n_rnn_layers, 1, self.lstm_hidden_dim))
+        with torch.no_grad():
+            dummy2, (hidden, cell) = self.lstm(dummy, (h0, c0))
+            print(f"lstm out: {dummy2.shape}, hidden: {hidden.shape}, cell: {cell.shape}")
+            ht = hidden.squeeze(0)
+            print(ht.shape)
+
+   
+    def forward(self, text, text_mask, h_0, c_0):
+        # Distilbert and LSTM network
+        '''
+        At every time step, the model reads one chunk which has a size of 20 words and chunk mask of size 20.
+
+        --- input & output dimension ---
+        
+        Input text: 1 * 20, mask: 1 * 20
+        
+        **DistilBERT**
+        1. Input(minibatch×seq_len, minibatch×seq_len): 1 * 20 * 100
+        2. Output(seq_len×minibatch×out_dim): 20 * 1 * 768
+        
+        **LSTM**
+        1. Inputs: input, (h_0, c_0)
+        input(seq_len, batch, input_size): (20, 1 , 768)
+        c_0(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        h_0(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        2. Outputs: output, (h_n, c_n)
+        output:
+        h_n(num_layers * num_directions, batch, hidden_size): (1 * 1, 1, 128)
+        
+
+        '''
+        embedded = self.distilbert(text, text_mask).last_hidden_state
+        trns = torch.permute(embedded, (1, 0, 2))
+        output, (hidden, cell) = self.lstm(trns, (h_0, c_0))
         ht = hidden.squeeze(0)  # 1 * 128
         return ht, cell
 
@@ -525,3 +738,6 @@ class GRUGate(nn.Module):
         z = self.sigmoid(self.Wz(y) + self.Uz(x) - self.bg)
         h = self.tanh(self.Wg(y) + self.Ug(torch.mul(r, x)))
         return torch.mul(1 - z, x) + torch.mul(z, h)
+
+if __name__ == "__main__":
+    model = Alpaca_LSTM(3, 128)
